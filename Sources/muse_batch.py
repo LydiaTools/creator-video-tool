@@ -148,7 +148,7 @@ def probe(path):
             "codec": video.get("codec_name"), "frame_rate": video.get("avg_frame_rate"), "has_audio": has_audio}
 
 
-def register_blocked(path, row, measured, directory, zip_sha):
+def register_blocked(path, row, measured, directory, zip_sha, source_thread_id=None):
     digest = tool.sha256(path)
     prior = next((card for card in tool.list_library()["assets"] if card.get("sha256") == digest and Path(card.get("path", "")).is_file()), None)
     card_path = Path(prior["card_path"]) if prior else path.with_suffix(path.suffix + ".json")
@@ -158,6 +158,7 @@ def register_blocked(path, row, measured, directory, zip_sha):
         "prompt": row.get("prompt", ""), "tags": row.get("tags", []), "shot_roles": row.get("shot_roles", []),
         "usage_notes": row.get("usage", ""), "in_out_points": row.get("in_out_points", ""),
         "generation_source": row.get("source", ""), "synthetic_marker": row.get("synthetic_marker", ""),
+        "muse_source_thread": source_thread_id,
         "rights_note": "用户授权MUSE生成并积累为候选；商业条款及本期发布范围待核实，非真实客户案例",
         "imported_at": datetime.now().astimezone().isoformat(),
         "cloud": {"status": "not_uploaded", "provider": None, "object_key": None, "remote_sha256_verified": False}}
@@ -174,7 +175,9 @@ def register_blocked(path, row, measured, directory, zip_sha):
     return blocked
 
 
-def receive(value):
+def receive(value, source_thread_id=None):
+    if source_thread_id is not None:
+        source_thread_id = str(uuid.UUID(source_thread_id))
     tool.mounted_volume()
     source = Path(value).expanduser()
     if source.is_symlink() or not source.is_file() or source.suffix.lower() != ".zip" or not source.resolve().is_relative_to(tool.VOLUME.resolve()):
@@ -198,12 +201,13 @@ def receive(value):
                         digest = row["sha256"].lower()
                         item = next((item for item in receipt["assets"] if item["sha256"] == digest), None)
                         if not item: raise ValueError("问题件未在已有接收报告中登记")
-                        register_blocked(Path(item["path"]), row, item["probe"], directory, receipt["source_zip_sha256"])
+                        register_blocked(Path(item["path"]), row, item["probe"], directory, receipt["source_zip_sha256"], source_thread_id)
                         item["needs_revision"] = True; item["pause_reason"] = row["reason"]
                 tool.atomic_json(receipt_path, receipt)
                 return {**receipt, "reused": True}
         directory.mkdir(parents=True, exist_ok=True)
         receipt = {"status": "receiving", "source_zip": str(source), "source_zip_sha256": tool.sha256(source),
+                   "muse_source_thread": source_thread_id,
                    "directory": str(directory), "assets": [], "visual_reviewed": False,
                    "zip_filename_flag_recovered": any(archive_name(item) != item.filename for item in archive.infolist()),
                    "created_at": datetime.now().astimezone().isoformat()}
@@ -228,7 +232,7 @@ def receive(value):
             checked = [(directory / name, row, probe(directory / name)) for name, row in rows]
             for path, row, measured in checked:
                 if row["blocked_record"]:
-                    register_blocked(path, row, measured, directory, receipt["source_zip_sha256"])
+                    register_blocked(path, row, measured, directory, receipt["source_zip_sha256"], source_thread_id)
                 result = tool.import_asset(str(path), "muse", "用户授权MUSE生成并积累为候选；商业条款及本期发布范围待核实，非真实客户案例")
                 card_path = Path(result["card_path"])
                 card = json.loads(card_path.read_text())
@@ -239,7 +243,7 @@ def receive(value):
                                  "usage_notes": row.get("usage", ""), "in_out_points": row.get("in_out_points", ""),
                                  "generation_source": row.get("source", "Muse AI生成"),
                                  "synthetic_marker": row.get("synthetic_marker", "AI合成示意"),
-                                 "muse_source_thread": "97fe87ab-a9b3-4e18-bb85-baa3ef47bb9d",
+                                 "muse_source_thread": source_thread_id,
                                  "batch_directory": str(directory)})
                     tool.atomic_json(card_path, card)
                 receipt["assets"].append({"material_id": card["material_id"], "path": result["asset_path"],
@@ -257,9 +261,10 @@ def receive(value):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("zip_path")
+    parser.add_argument("--source-thread", help="实际 MUSE 旁聊 UUID；未提供时保留未知，不猜测来源")
     args = parser.parse_args()
     try:
-        tool.emit({"ok": True, "data": receive(args.zip_path)})
+        tool.emit({"ok": True, "data": receive(args.zip_path, args.source_thread)})
     except Exception as error:
         tool.emit({"ok": False, "error": str(error)})
         raise SystemExit(1)
