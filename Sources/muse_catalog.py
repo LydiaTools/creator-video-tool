@@ -20,6 +20,8 @@ def classify(asset, previous):
     subject = " ".join([asset.get("display_name", ""), *asset.get("tags", [])])
     if "草皮" in subject or re.search(r"\bsod\b", subject, flags=re.IGNORECASE):
         return CATEGORIES[1], "草皮采购与铺设"
+    if "盆栽土" in subject or re.search(r"\bpotting\s+soil\b", subject, flags=re.IGNORECASE):
+        return CATEGORIES[1], "盆栽用土与容器"
     if any(word in words for word in ["中文口播", "信息加工", "创作者", "口播", "电脑", "键鼠", "文件夹"]):
         if any(word in words for word in ["审听", "试听", "耳机", "改稿"]):
             return CATEGORIES[0], "审稿与试听"
