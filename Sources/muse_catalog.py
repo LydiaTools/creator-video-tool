@@ -3,6 +3,7 @@ from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import json
+import re
 
 import video_tool
 
@@ -16,6 +17,9 @@ def classify(asset, previous):
         return previous["category"], previous.get("subcategory", "未细分")
     words = " ".join([asset.get("display_name", ""), *asset.get("tags", []),
                       *asset.get("shot_roles", []), asset.get("usage_notes", "")])
+    subject = " ".join([asset.get("display_name", ""), *asset.get("tags", [])])
+    if "草皮" in subject or re.search(r"\bsod\b", subject, flags=re.IGNORECASE):
+        return CATEGORIES[1], "草皮采购与铺设"
     if any(word in words for word in ["中文口播", "信息加工", "创作者", "口播", "电脑", "键鼠", "文件夹"]):
         if any(word in words for word in ["审听", "试听", "耳机", "改稿"]):
             return CATEGORIES[0], "审稿与试听"
