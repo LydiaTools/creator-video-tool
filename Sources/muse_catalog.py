@@ -24,6 +24,8 @@ def classify(asset, previous):
         return CATEGORIES[1], "盆栽用土与容器"
     if "松针" in subject or re.search(r"\bpine\s+straw\b", subject, flags=re.IGNORECASE):
         return CATEGORIES[1], "松针覆盖物采购与铺设"
+    if "碎石" in subject or re.search(r"\bgravel\b", subject, flags=re.IGNORECASE):
+        return CATEGORIES[1], "碎石采购与铺设"
     if any(word in words for word in ["中文口播", "信息加工", "创作者", "口播", "电脑", "键鼠", "文件夹"]):
         if any(word in words for word in ["审听", "试听", "耳机", "改稿"]):
             return CATEGORIES[0], "审稿与试听"
