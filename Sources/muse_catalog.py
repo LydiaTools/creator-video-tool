@@ -69,6 +69,8 @@ def refresh():
                           shot_roles=asset.get("shot_roles", []), usage=asset.get("usage_notes", ""),
                           needs_revision=blocked, synthetic_marker=asset.get("synthetic_marker", ""),
                           publication_approved=bool(asset.get("cleared_for_publication", False))))
+        if asset.get("derivation"):
+            items[-1]["derivation"] = asset["derivation"]
     items.sort(key=lambda item: item["material_id"])
     existing = sorted(previous.get("items", []), key=lambda item: item["material_id"])
     if existing == items and (root / "从这里选素材.md").is_file():
@@ -78,8 +80,11 @@ def refresh():
     data.setdefault("source", "按实际素材卡刷新取用目录；原件、名称、标签和素材卡不改动")
     video_tool.atomic_json(target, data)
     muse = [item for item in items if item["source"] == "muse"]
+    derived = sum(bool(item.get("derivation")) for item in muse)
+    source_summary = (f"MUSE素材{len(muse)}件（生成交付原件{len(muse) - derived}件、派生版{derived}件）"
+                      if derived else f"MUSE原件{len(muse)}件")
     lines = ["# 从这里选素材", "", "在“视频制作”应用的“素材库”按名称或标签找。下面直接链接原件。", "",
-             f"更新：{timestamp}。共享素材卡{len(items)}张；MUSE原件{len(muse)}件，其中内部候选"
+             f"更新：{timestamp}。共享素材卡{len(items)}张；{source_summary}，其中内部候选"
              f"{sum(not item['needs_revision'] for item in muse)}件、禁选{sum(item['needs_revision'] for item in muse)}件。", "",
              "合成画面作情境与解释；真实软件功能、账号数据和效果证据使用自己的录屏或实拍。", ""]
     for category in CATEGORIES + ["待确认用途"]:
@@ -102,7 +107,8 @@ def refresh():
     temporary = entry.with_suffix(".md.tmp")
     temporary.write_text("\n".join(lines) + "\n")
     temporary.replace(entry)
-    return {"changed": True, "cards": len(items), "muse": len(muse),
+    return {"changed": True, "cards": len(items), "muse": len(muse), "muse_originals": len(muse) - derived,
+            "muse_derivatives": derived,
             "categories": dict(Counter(item["category"] for item in items)), "entry": str(entry)}
 
 
