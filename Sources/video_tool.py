@@ -10,10 +10,12 @@ import signal
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+import production
 
 
 VOLUME = Path("/Volumes/Obsidian知识库")
@@ -24,8 +26,27 @@ RELEASE = VOLUME / "自动化技能备份/2026-08-28_B站视频出海固定工�
 RUNTIME = VOLUME / "自动化技能备份/2026-08-28_B站视频出海固定工作流/runtime_2026-08-28"
 MIN_INTERNAL_FREE = 20 * 1024**3
 SUPPORT = Path.home() / "Library/Application Support/出海视频"
-SAFE_MEDIA = Path("/Users/macmini/Documents/Codex/2026-09-06/b-stable3/scripts/run_media_safely.sh")
 ACTIVE_CHILD = None
+
+
+class StageFailure(RuntimeError):
+    def __init__(self, message, workspace, category="process_failure", log_path=""):
+        super().__init__(message)
+        self.workspace = workspace
+        self.category = category
+        self.log_path = str(log_path)
+
+
+def terminate_child(child):
+    if child and child.poll() is None:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+            child.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+        except ProcessLookupError:
+            child.wait()
 
 
 def progress(message):
@@ -35,13 +56,7 @@ def progress(message):
 def stop_child(*_):
     global ACTIVE_CHILD
     child = ACTIVE_CHILD
-    if child and child.poll() is None:
-        os.killpg(child.pid, signal.SIGTERM)
-        try:
-            child.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait()
+    terminate_child(child)
     raise SystemExit(130)
 
 
@@ -93,13 +108,58 @@ def mounted_volume():
         raise RuntimeError("外接盘身份不符，已停止读取和写入")
 
 
-def disk_status():
+def resource_snapshot():
+    processes = subprocess.run(["/bin/ps", "-axo", "pid=,rss=,command="],
+                               capture_output=True, text=True, timeout=5, check=True).stdout
+    largest_renderer = 0
+    heavy_pids = []
+    import shlex
+    for line in processes.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3:
+            continue
+        pid, rss, command = fields
+        if "ClonBrowserCore Helper (Renderer)" in command:
+            largest_renderer = max(largest_renderer, int(rss))
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        if any(Path(token).name in {"media_pipeline.py", "prepare_workspace.py", "temp_synth_segmented.py"}
+               for token in tokens):
+            heavy_pids.append(int(pid))
+    memory = subprocess.run(["/usr/bin/memory_pressure", "-Q"], capture_output=True,
+                            text=True, timeout=5, check=True).stdout
+    import re
+    match = re.search(r"System-wide memory free percentage:\s*(\d+)%", memory)
+    if not match:
+        raise RuntimeError("无法核实系统可用内存，停止启动重型任务")
+    return {"memory_free_percent": int(match.group(1)),
+            "largest_renderer_mib": round(largest_renderer / 1024, 1),
+            "heavy_process_pids": heavy_pids}
+
+
+def disk_status(check_running=True):
     mounted_volume()
     internal_free = shutil.disk_usage(Path.home()).free
     external_free = shutil.disk_usage(VOLUME).free
     release_present = (RELEASE / "SKILL.md").is_file()
     runtime_present = RUNTIME.is_dir()
-    reason = "内置盘低于 20 GiB，暂停新的 ASR/TTS/转码" if internal_free < MIN_INTERNAL_FREE else ("Stable3 发布包或运行时缺失" if not release_present or not runtime_present else "")
+    resources = resource_snapshot()
+    reasons = []
+    if internal_free < MIN_INTERNAL_FREE:
+        reasons.append("内置盘低于 20 GiB，暂停 ASR/TTS/转码")
+    if external_free < 2 * 1024**3:
+        reasons.append("外盘剩余空间不足 2 GiB")
+    if resources["memory_free_percent"] < 20:
+        reasons.append("系统可用内存低于 20%")
+    if resources["largest_renderer_mib"] > 1536:
+        reasons.append("ClonBrowser 页面超过 1.5 GiB，请先关闭对应页面")
+    if check_running and resources["heavy_process_pids"]:
+        reasons.append("已有 ASR 或媒体制作进程在运行")
+    if not release_present or not runtime_present:
+        reasons.append("Stable3 发布包或运行时缺失")
+    reason = "；".join(reasons)
     return {
         "internal_free_gib": round(internal_free / 1024**3, 1),
         "external_free_gib": round(external_free / 1024**3, 1),
@@ -108,7 +168,15 @@ def disk_status():
         "release_present": release_present,
         "runtime_present": runtime_present,
         "library": str(LIBRARY),
+        **resources,
     }
+
+
+def ensure_media_resources(check_running=True):
+    status = disk_status(check_running=check_running)
+    if not status["can_run_media"]:
+        raise RuntimeError(status["media_block_reason"])
+    return status
 
 
 def run_process(argv, cwd=None, timeout=None):
@@ -282,11 +350,13 @@ def search_assets(query):
     assets = list_library()["assets"]
     if not needle:
         return {"assets": assets}
+    terms = needle.split()
     found = []
     for card in assets:
         fields = [card.get("material_id", ""), card.get("display_name", ""),
                   card.get("origin", ""), *card.get("tags", []), *card.get("shot_roles", [])]
-        if needle in " ".join(str(value) for value in fields).casefold():
+        searchable = " ".join(str(value) for value in fields).casefold()
+        if needle in searchable or (len(terms) > 1 and all(term in searchable for term in terms)):
             found.append(card)
     return {"assets": found}
 
@@ -366,6 +436,11 @@ def workspace_snapshot(value):
     displayed = script_path.read_text() if script_path.is_file() else draft
     reviewed_payload = json.dumps({"script": displayed, "language": [{"index": s.get("index"), "zh_fixed": s.get("zh_fixed"), "en_final": s.get("en_final")} for s in segments]}, ensure_ascii=False, sort_keys=True)
     final_path = path / "final_en_softsub.mp4"
+    approval = production.approval_state(path, RELEASE, state, segments)
+    finished = (final_path.is_file() and final_path.stat().st_size > 0
+                and final_report.get("passed") is True and approval["valid"]
+                and approval.get("media_plan_matches") is True
+                and stages.get("media", {}).get("status") == "done")
     return {"workspace": str(path), "title": Path(state.get("source_video", path.name)).stem,
             "prepare": stages.get("prepare", {}).get("status", "未准备"),
             "translation": stages.get("translation", {}).get("status", "待翻译"),
@@ -375,14 +450,19 @@ def workspace_snapshot(value):
             "script_matches_segments": displayed.strip() == draft.strip(),
             "review_sha256": hashlib.sha256(reviewed_payload.encode()).hexdigest(),
             "report": report, "final_report": final_report,
-            "approved": (path / "translation.lock.json").is_file() and stages.get("translation", {}).get("status") == "done",
-            "finished": final_path.is_file() and final_report.get("passed") is True,
+            "approved": approval["valid"] and stages.get("translation", {}).get("status") == "done",
+            "approval_check": approval, "finished": finished,
+            "protected_final": final_path.exists() or final_report_path.exists(),
+            "production": production.summary(path),
+            "segment_count": len(segments),
+            "qa_passed_count": len(stages.get("media", {}).get("qa_passed_segments", [])),
             "final_path": str(final_path), "script_path": str(script_path)}
 
 
-def run_stage(workspace, title, argv, timeout=600):
+def run_stage(workspace, title, argv, timeout=600, heavy=False, monitor_interval=10):
     global ACTIVE_CHILD
     mounted_volume()
+    initial_resources = ensure_media_resources() if heavy else None
     logs = workspace / "tool_logs"
     logs.mkdir(exist_ok=True)
     temp = workspace / "tool_tmp"
@@ -390,40 +470,135 @@ def run_stage(workspace, title, argv, timeout=600):
     path = logs / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6] + ".log")
     progress(title)
     SUPPORT.mkdir(parents=True, exist_ok=True)
-    atomic_json(SUPPORT / "last_task.json", {"workspace": str(workspace), "stage": title,
-                "log_path": str(path), "updated_at": datetime.now().timestamp()})
+    run = {"id": uuid.uuid4().hex, "stage": title, "started_at": datetime.now().astimezone().isoformat(),
+           "status": "running", "log_path": str(path), "elapsed_seconds": 0,
+           "resource_start": initial_resources,
+           "min_internal_free_gib": initial_resources.get("internal_free_gib") if initial_resources else None,
+           "min_memory_free_percent": initial_resources.get("memory_free_percent") if initial_resources else None,
+           "max_renderer_mib": initial_resources.get("largest_renderer_mib") if initial_resources else None}
+    def persist():
+        # Recheck the mounted volume before writing; never recreate an absent external path.
+        mounted_volume()
+        production.save_run(workspace, run, atomic_json)
+        atomic_json(SUPPORT / "last_task.json", {"workspace": str(workspace), "stage": title,
+                    "status": run["status"], "log_path": str(path), "run_id": run["id"],
+                    "updated_at": datetime.now().timestamp()})
+    started = time.monotonic()
+    persist()
     with path.open("x", encoding="utf-8") as log:
-        child = subprocess.Popen(["/usr/bin/nice", "-n", "15"] + argv, stdout=log, stderr=subprocess.STDOUT, cwd=RELEASE,
-                                 start_new_session=True,
-                                 env={**os.environ, "TMPDIR": str(temp), "PYTHONUNBUFFERED": "1",
-                                      "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2",
-                                      "VECLIB_MAXIMUM_THREADS": "2"})
-        ACTIVE_CHILD = child
         try:
-            child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            stop_child()
+            child = subprocess.Popen(["/usr/bin/nice", "-n", "15"] + argv, stdout=log, stderr=subprocess.STDOUT, cwd=RELEASE,
+                                     start_new_session=True,
+                                     env={**os.environ, "TMPDIR": str(temp), "PYTHONUNBUFFERED": "1",
+                                          "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2",
+                                          "MKL_NUM_THREADS": "2", "VECLIB_MAXIMUM_THREADS": "2"})
+        except OSError as error:
+            run.update(status="failed", finished_at=datetime.now().astimezone().isoformat(),
+                       failure={"category": "process_failure", "message": str(error),
+                                "next": "程序未能启动，核对本机 Python 与固定运行时。"})
+            persist()
+            raise StageFailure(f"无法启动{title}：{error}", workspace, log_path=path) from error
+        ACTIVE_CHILD = child
+        run["pid"] = child.pid
+        last_sample = started
+        resource_failures = 0
+        try:
+            while child.poll() is None:
+                now = time.monotonic()
+                if now - started > timeout:
+                    terminate_child(child)
+                    run["status"] = "timed_out"
+                    raise StageFailure(f"{title}超时，已停止进程并保留工作区", workspace, "timeout", path)
+                if heavy and now - last_sample >= monitor_interval:
+                    last_sample = now
+                    try:
+                        resources = disk_status(check_running=False)
+                        for target, source, reducer in (("min_internal_free_gib", "internal_free_gib", min),
+                                                        ("min_memory_free_percent", "memory_free_percent", min),
+                                                        ("max_renderer_mib", "largest_renderer_mib", max)):
+                            prior = run[target]
+                            run[target] = resources[source] if prior is None else reducer(prior, resources[source])
+                        resource_failures = 0 if resources["can_run_media"] else resource_failures + 1
+                        if resource_failures >= 2:
+                            terminate_child(child)
+                            run["status"] = "resource_stopped"
+                            raise StageFailure(resources["media_block_reason"] + "；本次已停止，保留分段可继续", workspace, "resource", path)
+                        run["elapsed_seconds"] = round(now - started, 1)
+                        run["last_activity_bytes"] = path.stat().st_size
+                        persist()
+                        state = production.read_json(workspace / "state.json", {})
+                        qa = len(state.get("stages", {}).get("media", {}).get("qa_passed_segments", []))
+                        progress(f"{title} · 已运行 {int((now-started)/60)} 分钟 · QA已通过 {qa} 段 · 内盘 {resources['internal_free_gib']} GiB")
+                    except StageFailure:
+                        raise
+                    except Exception as error:
+                        terminate_child(child)
+                        run["status"] = "resource_stopped"
+                        raise StageFailure(f"资源状态无法核实：{error}；本次已停止", workspace, "resource", path) from error
+                time.sleep(0.5)
+            if child.returncode:
+                with path.open("rb") as details:
+                    details.seek(max(0, path.stat().st_size - 5000))
+                    detail = details.read().decode("utf-8", errors="replace")
+                raise StageFailure(f"{title}失败：{detail}\n运行记录：{path}", workspace,
+                                   production.failure_kind(detail), path)
+            run["status"] = "succeeded"
+        except SystemExit:
+            run["status"] = "cancelled"
+            run["failure"] = {"category": "cancelled", "message": production.recovery_message("cancelled")}
+            raise
+        except StageFailure as error:
+            if run["status"] == "running":
+                run["status"] = "failed"
+            run["failure"] = {"category": error.category, "message": str(error)[-5000:],
+                              "next": production.recovery_message(error.category)}
+            raise
         finally:
             ACTIVE_CHILD = None
-    if child.returncode:
-        with path.open("rb") as log:
-            log.seek(max(0, path.stat().st_size - 3000))
-            detail = log.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{title}失败：{detail}\n运行记录：{path}")
+            run["finished_at"] = datetime.now().astimezone().isoformat()
+            run["elapsed_seconds"] = round(time.monotonic() - started, 1)
+            run["exit_code"] = child.returncode
+            try:
+                persist()
+            except Exception:
+                # The external drive may have been disconnected; retain only an internal reference.
+                atomic_json(SUPPORT / "last_task.json", {"workspace": str(workspace), "stage": title,
+                            "status": run["status"], "updated_at": datetime.now().timestamp(),
+                            "record_write_failed": True, "log_path": str(path)})
+    return {"log_path": str(path), "run": run}
 
 
 def verify_package(workspace):
     run_stage(workspace, "检查 Stable3 发布文件", [sys.executable, str(RELEASE / "scripts/verify_release.py")])
 
 
+def recover_timing(workspace):
+    snapshot = workspace_snapshot(str(workspace))
+    approval = snapshot["approval_check"]
+    if not approval["valid"] or approval.get("media_plan_matches") is not True:
+        raise StageFailure("QA 后媒体计划未稳定一致，保持原视频；请先核对媒体计划", workspace, "media_plan")
+    if snapshot["protected_final"] or (workspace / "video_adjusted_presync.mp4").exists():
+        raise StageFailure("已有最终文件或预校正留档，不重复时长修复", workspace, "timing")
+    helper = Path(__file__).with_name("stable3_timing.py")
+    result = run_stage(workspace, "核对帧舍入误差并验证时长候选",
+                       [sys.executable, str(helper), "--workspace", str(workspace), "--write-candidate"],
+                       timeout=600, heavy=True)
+    candidate = production.read_json(Path(result["log_path"]))
+    production.activate_candidate(workspace, candidate,
+        lambda: workspace_snapshot(str(workspace))["approval_check"], atomic_json)
+    progress("时长候选验证通过，已保留原文件；继续原版终检")
+
+
 def operate_workspace(action, value, provider="", model="", effort="", reviewed_sha="", confirmed=False):
     path = workspace_path(value)
+    if action == "resume":
+        return workspace_snapshot(value)
     with media_lock():
         snapshot = workspace_snapshot(value)
-        if action == "resume":
-            return snapshot
         if snapshot["finished"]:
             raise RuntimeError("已有成片和通过报告，不重复制作；可直接打开交付文件")
+        if action == "media" and snapshot.get("protected_final"):
+            raise RuntimeError("已有最终媒体文件但当前核对未通过；保留成片，请核对批准锁和报告，不自动覆盖")
         if snapshot["prepare"] != "done":
             raise RuntimeError("先继续完成源片准备，再验证英文稿或制作媒体")
         if action == "approve":
@@ -461,20 +636,24 @@ def operate_workspace(action, value, provider="", model="", effort="", reviewed_
             run_stage(path, "锁定你已批准的英文稿", [sys.executable, str(RELEASE / "scripts/mark_translation.py"), "--workspace", str(path),
                       "--provider", provider, "--model", model, "--reasoning-effort", effort, "--approve"])
         elif action == "media":
-            run_stage(path, "原管线制作英文配音、字幕和视频", ["/bin/zsh", str(SAFE_MEDIA), "--workspace", str(path)], timeout=14400)
+            argv = [sys.executable, str(RELEASE / "scripts/media_pipeline.py"), "--workspace", str(path)]
+            try:
+                run_stage(path, "原管线制作英文配音、字幕和视频", argv, timeout=14400, heavy=True)
+            except StageFailure as error:
+                if error.category != "timing":
+                    raise
+                recover_timing(path)
+                # One bounded recovery, followed by all original quality gates; never loop.
+                run_stage(path, "帧时长恢复后继续原版质量门", argv, timeout=14400, heavy=True)
         else:
             raise ValueError("未知工作区操作")
         return workspace_snapshot(value)
 
 
 def prepare_video(source):
-    status = disk_status()
-    if not status["can_run_media"]:
-        raise RuntimeError(status["media_block_reason"])
-    if not status["release_present"] or not status["runtime_present"]:
-        raise RuntimeError("冻结 Stable3 发布包或离线运行时不存在")
-    source = Path(source).expanduser()
-    if source.is_symlink() or not source.is_file():
+    mounted_volume()
+    source = Path(source).expanduser().resolve(strict=True)
+    if not source.is_file():
         raise ValueError("源视频必须是普通文件")
     scripts = RELEASE / "scripts"
     with media_lock():
@@ -484,8 +663,10 @@ def prepare_video(source):
         jobs = json.loads(jobs_path.read_text()) if jobs_path.is_file() else []
         for job in jobs:
             registered = Path(job["workspace"])
-            if job.get("source_sha256") == digest and ((registered / "state.json").is_file() or (registered / "tool_input.json").is_file()):
+            if (job.get("source_sha256") == digest and registered.resolve().is_relative_to(VOLUME.resolve())
+                    and ((registered / "state.json").is_file() or (registered / "tool_input.json").is_file())):
                 return {"workspace": job["workspace"], "source_sha256": digest, "stage": "existing_workspace", "reused": True}
+        ensure_media_resources()
         workspace = WORK_ROOT / (datetime.now().strftime("%Y-%m-%d_%H-%M-%S-") + uuid.uuid4().hex[:6] + "-出海视频工具") / "stable3_workspace"
         workspace.mkdir(parents=True, exist_ok=False)
         atomic_json(workspace / "tool_input.json", {"source": str(source.resolve()), "source_sha256": digest})
@@ -497,24 +678,23 @@ def prepare_video(source):
 
 
 def prepare_in_workspace(source, workspace, scripts):
-    run_stage(workspace, "检查内存和重任务资源", ["/bin/zsh", str(SAFE_MEDIA), "--workspace", str(workspace), "--check-only"], timeout=30)
+    ensure_media_resources()
     for args, title in ((["verify_release.py"], "检查发布文件"),
                         (["verify_release.py", "--environment"], "检查冻结运行时"),
                         (["runtime_smoke.py"], "运行固定语音回归")):
-        run_stage(workspace, title, [sys.executable, str(scripts / args[0])] + args[1:], timeout=1800)
-    run_stage(workspace, "检查源片并识别中文", [sys.executable, str(scripts / "prepare_workspace.py"), str(source), "--workspace", str(workspace)], timeout=14400)
+        run_stage(workspace, title, [sys.executable, str(scripts / args[0])] + args[1:],
+                  timeout=1800, heavy=args[0] == "runtime_smoke.py")
+    run_stage(workspace, "检查源片并识别中文", [sys.executable, str(scripts / "prepare_workspace.py"), str(source), "--workspace", str(workspace)], timeout=14400, heavy=True)
 
 
 def resume_prepare(value):
     path = workspace_path(value)
-    status = disk_status()
-    if not status["can_run_media"]:
-        raise RuntimeError(status["media_block_reason"] or "运行时不完整")
     state_path = path / "state.json"
     state = json.loads(state_path.read_text()) if state_path.is_file() else {}
     if state.get("stages", {}).get("prepare", {}).get("status") == "done":
         return workspace_snapshot(value)
     with media_lock():
+        ensure_media_resources()
         source = Path(state.get("source_video") or json.loads((path / "tool_input.json").read_text())["source"])
         if (path / "tool_input.json").is_file():
             original = json.loads((path / "tool_input.json").read_text())
@@ -594,7 +774,15 @@ def main():
             result = prepare_video(args.source)
         emit({"ok": True, "data": result})
     except Exception as error:
-        emit({"ok": False, "error": str(error)})
+        response = {"ok": False, "error": str(error)}
+        if isinstance(error, StageFailure):
+            response["failure_category"] = error.category
+            response["recovery_hint"] = production.recovery_message(error.category)
+            try:
+                response["recovery"] = workspace_snapshot(str(error.workspace))
+            except Exception:
+                pass
+        emit(response)
         return 1
     return 0
 

@@ -29,3 +29,7 @@ work/
 *.png
 *.jpg
 *.jpeg
+tool_run_ledger.json
+tool_timing_recovery.json
+last_task.json
+jobs.json

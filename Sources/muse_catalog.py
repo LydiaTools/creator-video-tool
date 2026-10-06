@@ -15,6 +15,8 @@ def classify(asset, previous):
     # Existing classifications may have been adjusted by the user.
     if previous.get("category"):
         return previous["category"], previous.get("subcategory", "未细分")
+    if asset.get("category"):
+        return asset["category"], asset.get("subcategory") or "未细分"
     words = " ".join([asset.get("display_name", ""), *asset.get("tags", []),
                       *asset.get("shot_roles", []), asset.get("usage_notes", "")])
     subject = " ".join([asset.get("display_name", ""), *asset.get("tags", [])])
@@ -33,6 +35,8 @@ def classify(asset, previous):
     if any(word in words for word in ["中文口播", "信息加工", "创作者", "口播", "电脑", "键鼠", "文件夹"]):
         if any(word in words for word in ["审听", "试听", "耳机", "改稿"]):
             return CATEGORIES[0], "审稿与试听"
+        if any(word in words.lower() for word in ["录音", "话筒", "麦克风", "配音", "旁白", "音色", "voiceover", "voice-over", "microphone", "narration"]):
+            return CATEGORIES[0], "声音与口播录制"
         if any(word in words for word in ["资料", "信息", "阅读", "筛选", "重点", "笔记"]):
             return CATEGORIES[0], "找资料与加工文案"
         return CATEGORIES[0], "创作与工具演示"
@@ -73,7 +77,33 @@ def refresh():
             items[-1]["derivation"] = asset["derivation"]
     items.sort(key=lambda item: item["material_id"])
     existing = sorted(previous.get("items", []), key=lambda item: item["material_id"])
-    if existing == items and (root / "从这里选素材.md").is_file():
+    entry = root / "从这里选素材.md"
+    def selection_entry_matches():
+        if not entry.is_file():
+            return False
+        expected = {}
+        for item in items:
+            if item["needs_revision"]:
+                continue
+            name = item["name"].replace("[", "（").replace("]", "）")
+            line = f"- [{name}](<{item['path']}>)｜{item['media_type']}｜{item['material_id']}"
+            expected[line] = item
+        current_category = current_subcategory = None
+        found = set()
+        for line in entry.read_text().splitlines():
+            if line.startswith("## "):
+                current_category = line[3:]
+                current_subcategory = None
+            elif line.startswith("### "):
+                current_subcategory = line[4:]
+            elif line in expected:
+                item = expected[line]
+                if (current_category, current_subcategory) != (item["category"], item["subcategory"]):
+                    return False
+                found.add(item["material_id"])
+        return found == {item["material_id"] for item in items if not item["needs_revision"]}
+
+    if existing == items and selection_entry_matches():
         return {"changed": False, "cards": len(items)}
     timestamp = datetime.now(timezone(timedelta(hours=8))).isoformat()
     data = dict(previous, schema=1, updated_at=timestamp, items=items)

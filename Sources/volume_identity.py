@@ -8,6 +8,9 @@ import sys
 
 
 def identity(path):
+    path = os.path.abspath(os.fspath(path))
+    if not os.path.isdir(path) or os.path.islink(path) or not os.path.ismount(path):
+        raise RuntimeError("指定路径不是已挂载的普通卷目录")
     cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
     da = ctypes.CDLL("/System/Library/Frameworks/DiskArbitration.framework/DiskArbitration")
     pointer = ctypes.c_void_p
@@ -57,7 +60,10 @@ def identity(path):
             raise RuntimeError("卷 UUID 无法读取")
         if not cf.CFURLGetFileSystemRepresentation(volume_url, True, path_buffer, len(path_buffer)):
             raise RuntimeError("卷挂载路径无法读取")
-        return {"VolumeUUID": uuid_buffer.value.decode("ascii"), "MountPoint": os.fsdecode(path_buffer.value)}
+        mount_point = os.fsdecode(path_buffer.value)
+        if os.path.abspath(mount_point) != path:
+            raise RuntimeError("系统返回的卷挂载路径与指定路径不一致")
+        return {"VolumeUUID": uuid_buffer.value.decode("ascii").upper(), "MountPoint": mount_point}
     finally:
         for value in reversed(owned):
             cf.CFRelease(value)

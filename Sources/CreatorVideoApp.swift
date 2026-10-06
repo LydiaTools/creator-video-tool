@@ -63,6 +63,7 @@ private final class ToolModel: ObservableObject {
     @Published var workspace = ""
     @Published var internalSpace = "检查中"
     @Published var externalSpace = "检查中"
+    @Published var memoryStatus = ""
     @Published var mediaAllowed = false
     @Published var mediaReason = "正在检查磁盘和运行时"
     @Published var busy = false
@@ -104,11 +105,14 @@ private final class ToolModel: ObservableObject {
     var visibleAssets: [[String: Any]] {
         let needle = assetFilter.trimmingCharacters(in: .whitespacesAndNewlines)
         if needle.isEmpty { return assets }
+        let terms = needle.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         return assets.filter { card in
             let fields = [card["material_id"] as? String ?? "",
                           card["display_name"] as? String ?? ""]
                 + (card["tags"] as? [String] ?? []) + (card["shot_roles"] as? [String] ?? [])
-            return fields.joined(separator: " ").localizedCaseInsensitiveContains(needle)
+            let searchable = fields.joined(separator: " ")
+            return searchable.localizedCaseInsensitiveContains(needle)
+                || (terms.count > 1 && terms.allSatisfy { searchable.localizedCaseInsensitiveContains($0) })
         }
     }
 
@@ -218,7 +222,7 @@ private final class ToolModel: ObservableObject {
     }
 
     private func acceptWorkspace(_ response: [String: Any]) {
-        guard let data = response["data"] as? [String: Any], let path = data["workspace"] as? String else {
+        guard let data = (response["data"] ?? response["recovery"]) as? [String: Any], let path = data["workspace"] as? String else {
             message = response["error"] as? String ?? "读取工作区失败"; return
         }
         workspaceInfo = data
@@ -228,7 +232,15 @@ private final class ToolModel: ObservableObject {
         provider = provenance["provider"] as? String ?? ""
         translationModel = provenance["model"] as? String ?? ""
         effort = provenance["reasoning_effort"] as? String ?? ""
-        message = data["finished"] as? Bool == true ? "已有成片，可直接预览视频和字幕" : "工作区已恢复；继续尚未完成的步骤"
+        if response["ok"] as? Bool != true {
+            message = response["recovery_hint"] as? String ?? response["error"] as? String ?? "本次任务未完成，工作区已保留"
+            if response["failure_category"] as? String == "resource" {
+                mediaAllowed = false
+                mediaReason = message
+            }
+        } else {
+            message = data["finished"] as? Bool == true ? "已有成片，可直接预览视频和字幕" : "工作区已恢复；继续尚未完成的步骤"
+        }
     }
 
     func workspaceAction(_ action: String) {
@@ -267,13 +279,16 @@ private final class ToolModel: ObservableObject {
             if let data = response["data"] as? [String: Any] {
                 self.internalSpace = "\(data["internal_free_gib"] ?? "?") GiB"
                 self.externalSpace = "\(data["external_free_gib"] ?? "?") GiB"
+                self.memoryStatus = "内存可用 \(data["memory_free_percent"] ?? "?")%"
                 self.mediaAllowed = data["can_run_media"] as? Bool ?? false
                 self.mediaReason = data["media_block_reason"] as? String ?? ""
-                self.message = self.mediaAllowed ? "外盘与磁盘预检通过" : self.mediaReason
+                self.message = self.mediaAllowed ? "外盘、空间和内存预检通过" : self.mediaReason
                 if !self.workspace.isEmpty && self.workspaceInfo.isEmpty { self.loadWorkspace(self.workspace) }
             } else {
                 self.message = response["error"] as? String ?? "预检失败"
                 self.mediaReason = self.message
+                self.mediaAllowed = false
+                if !self.workspace.isEmpty && self.workspaceInfo.isEmpty { self.loadWorkspace(self.workspace) }
             }
         }
     }
@@ -498,6 +513,7 @@ private struct ContentView: View {
                 Label("内置盘剩余 \(model.internalSpace)", systemImage: "internaldrive")
                 Spacer()
                 Label("外接盘剩余 \(model.externalSpace)", systemImage: "externaldrive")
+                Text(model.memoryStatus).foregroundStyle(.secondary)
                 Button { model.doctor() } label: { Image(systemName: "arrow.clockwise") }
                     .help("刷新磁盘与运行时状态").disabled(model.busy)
             }
@@ -520,10 +536,10 @@ private struct ContentView: View {
             }
             .padding(15)
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(.gray.opacity(0.35)))
-            Button("检查源片并建立独立工作区") { model.prepareVideo() }
+            Button("读取或准备这个视频") { model.prepareVideo() }
                 .buttonStyle(.borderedProminent)
                 .tint(blue)
-                .disabled(model.busy || !model.mediaAllowed || model.sourceVideo == nil)
+                .disabled(model.busy || model.sourceVideo == nil)
             HStack {
                 Button("打开已有工作区…") { model.openWorkspace() }.disabled(model.busy)
                 if !model.recentWorkspaces.isEmpty {
@@ -554,6 +570,36 @@ private struct ContentView: View {
             }
             Text(verbatim: finished ? "自动媒体报告通过 · 完整视听待你确认" : "准备：\(stageLabel(data["prepare"]))    英文稿：\(stageLabel(data["translation"]))    媒体：\(stageLabel(data["media"]))")
                 .font(.system(size: 13)).foregroundStyle(finished ? .green : .secondary)
+            if let production = data["production"] as? [String: Any] {
+                let seconds = production["recorded_process_seconds"] as? Double ?? 0
+                let failures = production["failed_run_count"] as? Int ?? 0
+                let hasRecords = (production["run_count"] as? Int ?? 0) > 0
+                HStack {
+                    Text(verbatim: "配音核验 \(data["qa_passed_count"] ?? 0)/\(data["segment_count"] ?? 0) 段")
+                    if hasRecords {
+                        Text("已记录运行 \(Int(seconds / 60)) 分钟 · 中断/失败 \(failures) 次")
+                    } else {
+                        Text("历史任务尚无运行台账")
+                    }
+                    Spacer()
+                    if FileManager.default.fileExists(atPath: model.workspace + "/tool_run_ledger.json") {
+                        Button("运行记录") { NSWorkspace.shared.open(URL(fileURLWithPath: model.workspace + "/tool_run_ledger.json")) }
+                    }
+                }.font(.system(size: 12)).foregroundStyle(.secondary)
+                if !finished, let failure = production["last_failure"] as? [String: Any],
+                   let details = failure["failure"] as? [String: Any], let next = details["next"] as? String {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(next).foregroundStyle(.orange)
+                        if let log = failure["log_path"] as? String {
+                            Button("查看本次失败日志") { NSWorkspace.shared.open(URL(fileURLWithPath: log)) }
+                        }
+                    }.font(.system(size: 12))
+                }
+            }
+            if !finished, let check = data["approval_check"] as? [String: Any],
+               let issue = check["issue"] as? String, !issue.isEmpty {
+                Text(issue).font(.system(size: 12)).foregroundStyle(.orange).textSelection(.enabled)
+            }
             if finished {
                 HStack {
                     Button("预览英文成片") { activeSheet = .media(MediaSelection(path: data["final_path"] as? String ?? "")) }
@@ -569,7 +615,7 @@ private struct ContentView: View {
                     Button("验证英文稿") { model.workspaceAction("validate") }.disabled(model.busy)
                     Button("查看分段稿") { NSWorkspace.shared.open(URL(fileURLWithPath: model.workspace + "/segments_translated.json")) }
                     Button("继续制作英文视频") { model.workspaceAction("media") }
-                        .disabled(model.busy || !approved || !model.mediaAllowed)
+                        .disabled(model.busy || !approved || !model.mediaAllowed || data["protected_final"] as? Bool == true)
                 }
             }
             if !script.isEmpty {

@@ -100,7 +100,7 @@ class ToolTests(unittest.TestCase):
             workspace = root / "workspace"; workspace.mkdir()
             (workspace / "state.json").write_text("{}")
             (root / "jobs.json").write_text(json.dumps([{"workspace": str(workspace), "source_sha256": video_tool.sha256(source)}]))
-            with patch.object(video_tool, "SUPPORT", root), patch.object(video_tool, "disk_status", return_value={"can_run_media": True, "release_present": True, "runtime_present": True}), patch.object(video_tool, "prepare_in_workspace") as prepare:
+            with patch.object(video_tool, "SUPPORT", root), patch.object(video_tool, "VOLUME", root), patch.object(video_tool, "mounted_volume"), patch.object(video_tool, "disk_status", return_value={"can_run_media": False, "media_block_reason": "low disk"}), patch.object(video_tool, "prepare_in_workspace") as prepare:
                 response = video_tool.prepare_video(str(source))
                 self.assertTrue(response["reused"])
                 prepare.assert_not_called()
@@ -126,7 +126,7 @@ class ToolTests(unittest.TestCase):
             workspace = root / "workspace"; workspace.mkdir()
             (workspace / "tool_input.json").write_text("{}")
             (root / "jobs.json").write_text(json.dumps([{"workspace": str(workspace), "source_sha256": video_tool.sha256(source)}]))
-            with patch.object(video_tool, "SUPPORT", root), patch.object(video_tool, "disk_status", return_value={"can_run_media": True, "release_present": True, "runtime_present": True}), patch.object(video_tool, "prepare_in_workspace") as prepare:
+            with patch.object(video_tool, "SUPPORT", root), patch.object(video_tool, "VOLUME", root), patch.object(video_tool, "mounted_volume"), patch.object(video_tool, "disk_status", return_value={"can_run_media": False, "media_block_reason": "low disk"}), patch.object(video_tool, "prepare_in_workspace") as prepare:
                 response = video_tool.prepare_video(str(source))
                 self.assertEqual(response["workspace"], str(workspace))
                 self.assertTrue(response["reused"])
@@ -219,6 +219,8 @@ class ToolTests(unittest.TestCase):
                     card_path.write_text(json.dumps(card, ensure_ascii=False))
                     ids.append(card["material_id"])
                 self.assertEqual(len(video_tool.search_assets("窗口管理")["assets"]), 2)
+                self.assertEqual(len(video_tool.search_assets("窗口 管理")["assets"]), 2)
+                self.assertEqual([item["display_name"] for item in video_tool.search_assets("窗口 背景")["assets"]], ["网格背景"])
                 manifest = video_tool.prepare_shot(ids, "开场")
                 data = json.loads(Path(manifest["manifest_path"]).read_text())
                 self.assertEqual(data["asset_count"], 2)
@@ -229,10 +231,14 @@ class ToolTests(unittest.TestCase):
                     video_tool.prepare_shot(ids + ids[:1], "too many")
 
     def test_media_refuses_low_internal_disk_before_mutation(self):
-        with patch.object(video_tool, "disk_status", return_value={
-            "can_run_media": False, "media_block_reason": "low disk"}):
-            with self.assertRaisesRegex(RuntimeError, "low disk"):
-                video_tool.prepare_video("/nonexistent.mp4")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            with patch.object(video_tool, "mounted_volume"), patch.object(video_tool, "SUPPORT", root), patch.object(video_tool, "WORK_ROOT", root / "work"), patch.object(video_tool, "disk_status", return_value={"can_run_media": False, "media_block_reason": "low disk"}):
+                with self.assertRaisesRegex(RuntimeError, "low disk"):
+                    video_tool.prepare_video(str(source))
+                self.assertFalse((root / "work").exists())
 
 
 if __name__ == "__main__":

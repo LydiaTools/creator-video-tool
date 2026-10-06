@@ -51,6 +51,22 @@ def inspect_package(archive):
         raise ValueError("需要一份不超过 1 MiB 的 INDEX.json")
     index = json.loads(archive.read(indices[0]))
     rows = index.get("assets", index.get("items")) if isinstance(index, dict) else index
+    if rows is None and isinstance(index, dict) and isinstance(index.get("file"), dict):
+        muse_file = index["file"]
+        rows = [{
+            "filename": muse_file.get("name"),
+            "display_name": index.get("title"),
+            "prompt": index.get("prompt"),
+            "sha256": muse_file.get("sha256"),
+            "tags": index.get("tags", []),
+            "shot_roles": index.get("shot_roles", []),
+            "review_issues": index.get("review_issues", []),
+            "usage": index.get("use_limits", ""),
+            "source": index.get("source", "MUSE AI生成"),
+            "synthetic_marker": index.get("synthetic_marker", "AI合成概念素材"),
+            "needs_revision": index.get("needs_revision", False),
+            "source_side_chat_id": index.get("source_side_chat_id"),
+        }]
     if not isinstance(rows, list) or not 1 <= len(rows) <= 6:
         raise ValueError("INDEX.json 的 assets 必须包含 1–6 件素材")
     paused = index.get("paused", []) if isinstance(index, dict) else []
@@ -186,6 +202,8 @@ def receive(value, source_thread_id=None):
         raise ValueError("批次 ZIP 超过 100 MiB")
     with tool.media_lock(), zipfile.ZipFile(source) as archive:
         rows = inspect_package(archive)
+        declared_sources = list(dict.fromkeys(row["source_side_chat_id"] for _, row in rows
+                                if isinstance(row.get("source_side_chat_id"), str)))
         if shutil.disk_usage(tool.VOLUME).free < 2 * 1024**3:
             raise RuntimeError("外盘剩余空间不足 2 GiB")
         directory = tool.LIBRARY / "MUSE候选" / datetime.now().strftime("%Y-%m-%d") / ("批次-" + tool.sha256(source)[:12])
@@ -208,6 +226,7 @@ def receive(value, source_thread_id=None):
         directory.mkdir(parents=True, exist_ok=True)
         receipt = {"status": "receiving", "source_zip": str(source), "source_zip_sha256": tool.sha256(source),
                    "muse_source_thread": source_thread_id,
+                   "index_declared_source_threads": declared_sources,
                    "directory": str(directory), "assets": [], "visual_reviewed": False,
                    "zip_filename_flag_recovered": any(archive_name(item) != item.filename for item in archive.infolist()),
                    "created_at": datetime.now().astimezone().isoformat()}
@@ -244,6 +263,7 @@ def receive(value, source_thread_id=None):
                                  "generation_source": row.get("source", "Muse AI生成"),
                                  "synthetic_marker": row.get("synthetic_marker", "AI合成示意"),
                                  "muse_source_thread": source_thread_id,
+                                 "index_declared_source_thread": row.get("source_side_chat_id"),
                                  "batch_directory": str(directory)})
                     tool.atomic_json(card_path, card)
                 receipt["assets"].append({"material_id": card["material_id"], "path": result["asset_path"],
